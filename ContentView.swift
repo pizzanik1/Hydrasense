@@ -833,7 +833,7 @@ private enum HistoryRange: String, CaseIterable, Identifiable {
 
 private struct DisplayScoreHistoryEntry: Identifiable {
     let id: UUID
-    let score: Int
+    let score: Double
     let riskLevel: HydrationRiskLevel
     let firstDate: Date
     let lastDate: Date
@@ -885,9 +885,15 @@ struct ContentView: View {
     @State private var simExplanation: String? = nil
 
     @State private var selectedTab: Int = 0
+    @State private var showingCurrentDetails = false
     @State private var allScoreHistory: [ScoreHistoryEntry] = []
     @AppStorage("hydrasense.historyRange") private var historyRangeRawValue = HistoryRange.twoMonths.rawValue
+    @AppStorage("hydrasense.aggregationLevel") private var aggregationLevelRawValue = AggregationLevel.weekly.rawValue
+    @AppStorage("hydrasense.aggregationDefaultUpdated") private var aggregationDefaultUpdated = false
 
+    private var aggregationLevel: AggregationLevel {
+        AggregationLevel(rawValue: aggregationLevelRawValue) ?? .all
+    }
     @Environment(\.scenePhase) private var scenePhase
 
     private let uiTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
@@ -1021,6 +1027,9 @@ struct ContentView: View {
     // MARK: - Scoring and Notification (unchanged)
 
     private func scoreAndMaybeNotify(sample: VitalSample, activity: ActivityContext? = nil) {
+        heartRate = sample.heartRateBPM
+        hrv = sample.hrvMS
+        restingHeartRate = sample.restingHeartRateBPM
         if skipMLOnce {
             mlOffProb = nil
             debugMLText = "ML: skipped once"
@@ -1041,7 +1050,8 @@ struct ContentView: View {
 
         guard baselineComplete() else {
             latestRisk = nil
-            statusText = "Baseline building… Day \(baselineDay())/14 (n=\(baseline.hr.n))"
+            PhoneConnectivityManager.shared.clearRiskScore(isSimulator: useSimulator)
+            statusText = "Baseline building… Day \(baselineDay())/14"
             return
         }
 
@@ -1063,7 +1073,13 @@ struct ContentView: View {
         recordScore(improved.score0to100)
         lastCheckTime = Date()
         latestRisk = improved
-        statusText = "Scored. Baseline n=\(baseline.hr.n)"
+        PhoneConnectivityManager.shared.sendRiskScore(
+            score: improved.score0to100,
+            riskLevel: improved.level.rawValue,
+            sampleDate: sample.timestamp,
+            isSimulator: useSimulator
+        )
+        statusText = "Scored"
 
         let crossedIntoHigh = (improved.level == .high && lastNotifiedLevel != .high)
 
@@ -1262,7 +1278,7 @@ struct ContentView: View {
                 lastHRDate = sample.timestamp
                 lastSeenHRDate = sample.timestamp
                 if sampleAgeSec > 120 {
-                    statusText = "HR \(Int(sample.heartRateBPM)) • sample \(sampleAgeSec)s old — open Health app to sync Watch"
+                    statusText = "Refreshed • HR \(Int(sample.heartRateBPM))"
                 } else {
                     let activityLabel = lastActivity?.summary ?? "activity pending"
                     statusText = "Refreshed • HR \(Int(sample.heartRateBPM)) • \(activityLabel)"
@@ -1292,12 +1308,13 @@ struct ContentView: View {
 
     /// Updates HR label immediately when anchored query delivers a sample (before full vitals fetch).
     private func applyQuickHRUpdate(hr: Double, date: Date) {
+        heartRate = hr
         liveDisplay.apply(heartRate: hr, timestamp: date, source: liveDisplay.phoneSource)
         lastHRDate = date
         lastSeenHRDate = date
         lastHRValue = hr
         let age = Int(Date().timeIntervalSince(date))
-        statusText = "Live HR \(Int(hr)) • sample age \(age)s"
+        statusText = "Live HR \(Int(hr)) bpm"
         // #region agent log
         DebugSessionLog.log(
             hypothesisId: "B",
@@ -1399,11 +1416,128 @@ struct ContentView: View {
         lastRefreshTime = nil
         lastHRDate = nil
         lastSeenHRDate = nil
+        heartRate = nil
+        hrv = nil
+        restingHeartRate = nil
         debugMLText = ""
         simExplanation = nil
     }
 
     // MARK: - Helpers
+
+    private func currentDetailRow(_ title: String, _ value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text(title)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 8)
+            Text(value)
+                .foregroundStyle(.primary)
+                .multilineTextAlignment(.trailing)
+        }
+        .font(.caption)
+    }
+
+    private func healthMetricCard(
+        title: String,
+        symbol: String,
+        value: Double?,
+        unit: String,
+        baselineValue: Double?,
+        tint: Color,
+        decimals: Int
+    ) -> some View {
+        let format = decimals == 0 ? "%.0f" : "%.1f"
+        let reading = value.map { String(format: format, $0) } ?? "—"
+        let comparison: String
+        if let value, let baselineValue {
+            let delta = value - baselineValue
+            comparison = String(format: "Baseline %@ %@", delta >= 0 ? "+" : "−", String(format: format, abs(delta)))
+        } else if value != nil {
+            comparison = "Baseline building"
+        } else {
+            comparison = "Waiting for reading"
+        }
+
+        return VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 7) {
+                Image(systemName: symbol)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(tint)
+                    .frame(width: 26, height: 26)
+                    .background(tint.opacity(0.12), in: Circle())
+                Text(title)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+            }
+
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text(reading)
+                    .font(.title2.bold().monospacedDigit())
+                    .foregroundStyle(.primary)
+                Text(unit)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Text(comparison)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+        }
+        .frame(maxWidth: .infinity, minHeight: 96, alignment: .leading)
+        .padding(11)
+        .background(tint.opacity(0.055), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(tint.opacity(0.14), lineWidth: 1)
+        }
+    }
+
+    private func activityMetricCard(_ activity: ActivityContext?) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 7) {
+                Image(systemName: "figure.walk")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.green)
+                    .frame(width: 26, height: 26)
+                    .background(Color.green.opacity(0.12), in: Circle())
+                Text("Recent Activity")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            if let activity {
+                Text("\(Int(activity.steps)) steps")
+                    .font(.subheadline.weight(.bold).monospacedDigit())
+                    .foregroundStyle(.primary)
+                Text("\(Int(activity.activeEnergyKcal)) kcal · last \(activity.windowMinutes) min")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+            } else {
+                Text("—")
+                    .font(.title2.bold())
+                    .foregroundStyle(.primary)
+                Text("Waiting for activity data")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 96, alignment: .leading)
+        .padding(11)
+        .background(Color.green.opacity(0.055), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(Color.green.opacity(0.14), lineWidth: 1)
+        }
+    }
 
     private func baselineProgress() -> Double {
         Double(baselineDay()) / 14.0
@@ -1496,6 +1630,25 @@ struct ContentView: View {
                 simExplanation = explanation
                 recordScore(improved.score0to100)
                 lastCheckTime = Date()
+                PhoneConnectivityManager.shared.sendRiskScore(
+                    score: improved.score0to100,
+                    riskLevel: improved.level.rawValue,
+                    sampleDate: sample.timestamp,
+                    isSimulator: true
+                )
+                let crossedIntoHigh = improved.level == .high && lastNotifiedLevel != .high
+                if crossedIntoHigh && canSendAlert() {
+                    diagLog.log("NOTIFY: simulator level=high score=\(improved.score0to100)")
+                    lastAlertTime = Date()
+                    lastNotifiedLevel = .high
+                    NotificationManager.shared.sendDehydrationAlert(
+                        score: improved.score0to100,
+                        level: improved.level
+                    )
+                }
+                if improved.level != .high {
+                    lastNotifiedLevel = improved.level
+                }
                 statusText = "Simulated \(mode == .hydrated ? "Hydrated" : "Dehydration") • score \(improved.score0to100)"
                 isWorking = false
             }
@@ -1554,63 +1707,85 @@ struct ContentView: View {
     var body: some View {
         NavigationStack {
             VStack {
-                Picker("Tab", selection: $selectedTab) {
-                    Text("Current").tag(0)
-                    Text("History").tag(1)
-                }
-                .pickerStyle(.segmented)
-                .padding(.top, 8)
-                .padding(.horizontal, 16)
-
                 if selectedTab == 0 {
                     ScrollView {
                         VStack(spacing: 14) {
 
                             Card(nil) {
-                                HStack(alignment: .top) {
-                                    VStack(alignment: .leading, spacing: 6) {
-                                        Text("HydraSense")
-                                            .font(.largeTitle.bold())
+                                VStack(spacing: 10) {
+                                    HStack {
+                                        Text("Risk Score")
+                                            .font(.headline)
+                                        Spacer()
+                                        Button {
+                                            withAnimation(.easeInOut(duration: 0.22)) {
+                                                showingCurrentDetails.toggle()
+                                            }
+                                        } label: {
+                                            Label(showingCurrentDetails ? "Hide Details" : "Details", systemImage: showingCurrentDetails ? "chevron.up.circle" : "info.circle")
+                                                .font(.caption.weight(.semibold))
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .tint(.blue)
+                                    }
 
-                                        Text(statusText)
-                                            .font(.subheadline)
-                                            .foregroundStyle(.secondary)
-
-                                        if !debugMLText.isEmpty {
-                                            Text(debugMLText)
+                                    if let risk = latestRisk {
+                                        RiskBadge(level: risk.level, score: risk.score0to100)
+                                        if useSimulator, let explanation = simExplanation {
+                                            Text(explanation)
                                                 .font(.caption)
                                                 .foregroundStyle(.secondary)
                                         }
+                                        if let details = risk.details {
+                                            Text(details)
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                                .lineLimit(2)
+                                        }
+                                    } else {
+                                        HStack(spacing: 12) {
+                                            Image(systemName: "chart.pie")
+                                                .font(.title2)
+                                                .foregroundStyle(.secondary)
+                                            Text("A risk score will appear after your next reading.")
+                                                .font(.subheadline)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                        .padding(.vertical, 4)
                                     }
-
-                                    Spacer()
-
-                                    StatusPill(
-                                        text: useSimulator ? "Simulator" : "HealthKit",
-                                        systemImage: useSimulator ? "sparkles" : "heart.fill",
-                                        color: useSimulator ? .purple : .pink
-                                    )
                                 }
                             }
 
-                            Card("Baseline") {
-                                VStack(alignment: .leading, spacing: 10) {
-                                    HStack {
-                                        Text("Day \(baselineDay()) / 14")
-                                            .font(.subheadline.weight(.semibold))
-                                        Spacer()
-                                        Text("Samples: \(baseline.hr.n)")
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
+                            if !currentScoreHistory.isEmpty {
+                                Card("Score Trend") {
+                                    Chart {
+                                        ForEach(Array(currentScoreHistory.enumerated()), id: \.offset) { index, score in
+                                            LineMark(
+                                                x: .value("Reading", index + 1),
+                                                y: .value("Score", score)
+                                            )
+                                        }
                                     }
-
-                                    ProgressView(value: baselineProgress())
-                                        .tint(.blue)
-
-                                    Text(baselineComplete() ? "Baseline complete ✅" : "Building baseline for personalization…")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
+                                    .chartXAxisLabel("Reading")
+                                    .frame(height: 140)
                                 }
+                            }
+
+                            if showingCurrentDetails {
+                                Card("Current Details") {
+                                    VStack(spacing: 9) {
+                                        currentDetailRow("Status", statusText)
+                                        currentDetailRow("Baseline samples", "n=\(baseline.hr.n) · Day \(baselineDay())/14")
+                                        currentDetailRow("ML probability", mlOffProb.map { String(format: "%.3f", $0) } ?? "Unavailable")
+                                        if !debugMLText.isEmpty {
+                                            currentDetailRow("ML", debugMLText)
+                                        }
+                                        currentDetailRow("Last poll", lastPollFiredAt.map { "\($0.formatted(date: .omitted, time: .shortened)) · \(pollCount) polls" } ?? "Not yet")
+                                        currentDetailRow("Last refresh", lastRefreshTime?.formatted(date: .omitted, time: .shortened) ?? "Not yet")
+                                        currentDetailRow("Last score", lastCheckTime?.formatted(date: .omitted, time: .shortened) ?? "Not yet")
+                                    }
+                                }
+                                .transition(.opacity.combined(with: .move(edge: .top)))
                             }
 
                             Card("Monitoring") {
@@ -1651,110 +1826,12 @@ struct ContentView: View {
                                         }
                                     }
 
-                                    if isMonitoringActive && !useSimulator, let hr = liveDisplay.heartRateBPM {
-                                        Text("Live: \(hr) bpm • sample \(liveDisplay.sampleAgeSec)s old")
-                                            .font(.subheadline.weight(.semibold))
-                                            .id(liveDisplay.pollCount)
-                                    }
-
                                     if let lastPollFiredAt, isMonitoringActive && !useSimulator {
                                         Text("Last poll: \(lastPollFiredAt.formatted(date: .omitted, time: .shortened)) • Polls: \(pollCount)")
                                             .font(.caption2)
                                             .foregroundStyle(.secondary)
                                     }
 
-                                    if let hint = liveDisplay.syncHint {
-                                        Text(hint)
-                                            .font(.caption)
-                                            .foregroundStyle(.orange)
-                                    }
-
-                                    if let d = lastHRDate {
-                                        Text("HR sample age: \(Int(uiNow.timeIntervalSince(d)))s")
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-
-                                    if isMonitoringActive && !useSimulator,
-                                       let d = lastHRDate,
-                                       Int(uiNow.timeIntervalSince(d)) > 120 {
-                                        Button("Open Health app to sync Watch data") {
-                                            if let url = URL(string: "x-apple-health://") {
-                                                UIApplication.shared.open(url)
-                                            }
-                                        }
-                                        .font(.caption)
-                                    }
-
-                                }
-                            }
-
-                            if let ctx = lastActivity {
-                                Text("Activity: \(ctx.summary)")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-
-                            Toggle(isOn: $useSimulator) {
-                                Text(useSimulator ? "Mode: Simulator" : "Mode: Real HealthKit")
-                            }
-                            .onChange(of: useSimulator) { newValue in
-                                if newValue {
-                                    enterSimulatorMode()
-                                } else {
-                                    latestRisk = nil
-                                    debugMLText = ""
-                                    realScoreHistory.removeAll()
-                                    post = RiskPostProcessor()
-                                    lastCheckTime = nil
-                                    lastRefreshTime = nil
-                                    lastHRDate = nil
-                                    lastSeenHRDate = nil
-                                    simExplanation = nil
-                                    enterRealMode()
-                                }
-                            }
-
-                            Card("Risk") {
-                                if let risk = latestRisk {
-                                    RiskBadge(level: risk.level, score: risk.score0to100)
-
-                                    if useSimulator, let explanation = simExplanation {
-                                        Text(explanation)
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                            .padding(.top, 4)
-                                    }
-
-                                    if let p = mlOffProb {
-                                        Text(String(format: "Core ML off-probability: %.2f", p))
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-
-                                    if let details = risk.details {
-                                        Text(details)
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                            .lineLimit(2)
-                                    }
-                                } else {
-                                    Text("No score yet.")
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-
-                            if !currentScoreHistory.isEmpty {
-                                Card("Score Trend") {
-                                    Chart {
-                                        ForEach(Array(currentScoreHistory.enumerated()), id: \.offset) { index, score in
-                                            LineMark(
-                                                x: .value("Reading", index + 1),
-                                                y: .value("Score", score)
-                                            )
-                                        }
-                                    }
-                                    .frame(height: 140)
                                 }
                             }
 
@@ -1768,7 +1845,8 @@ struct ContentView: View {
                                         baseline.add(sample: sample)
                                     }
                                     latestRisk = nil
-                                    statusText = "Baseline built: \(baseline.hr.n) samples"
+                                    PhoneConnectivityManager.shared.clearRiskScore(isSimulator: true)
+                                    statusText = "Baseline built"
                                 }
 
                                 Button(isWorking ? "Working..." : "Simulate Hydrated Reading") {
@@ -1782,128 +1860,107 @@ struct ContentView: View {
                                 .disabled(isWorking)
 
                             } else {
-                                Button("Build Baseline from HealthKit (Last 14 Days)") {
-                                    statusText = "Building baseline from last 14 days..."
-                                    healthKitManager.buildBaselineFromLastDays(days: 14) { newBaseline, daysUsed in
-                                        guard let newBaseline = newBaseline else {
-                                            statusText = "Not enough Health data to build baseline."
-                                            return
-                                        }
-                                        baseline = newBaseline
-                                        BaselineStore.shared.saveBaseline(baseline)
-                                        let start = Calendar.current.date(byAdding: .day, value: -14, to: Date())!
-                                        baselineStartDate = start
-                                        UserDefaults.standard.set(start, forKey: "hydrasense.baselineStart")
-                                        latestRisk = nil
-                                        statusText = "Baseline built from \(daysUsed) days ✅"
-                                    }
-                                }
+                            }
 
-                                Button("Read HealthKit (Real) → Score") {
-                                    statusText = "Fetching vitals..."
-                                    healthKitManager.fetchLatestVitals { sample in
-                                        DispatchQueue.main.async {
-                                            guard let sample = sample else {
-                                                statusText = "No HealthKit samples found."
-                                                return
-                                            }
-
-                                            debugPrintSample(sample, tag: "HK Manual Read")
-
-                                            if !isValidForML(sample) {
-                                                print("⚠️ sample fails sanity checks; skipping ML", sample)
-                                                mlOffProb = nil
-                                            } else {
-                                                mlOffProb = MLPredictor.shared.offProbability(sample: sample)
-                                            }
-
-                                            debugMLText = mlOffProb == nil ? "ML: nil" : String(format: "ML: %.3f", mlOffProb!)
-
-                                            print("📥 CoreML INPUTS",
-                                                  "hr=\(sample.heartRateBPM)",
-                                                  "hrv=\(sample.hrvMS)",
-                                                  "rhr=\(sample.restingHeartRateBPM)")
-
-                                            if let p = mlOffProb {
-                                                print("✅ CoreML output offProbability =", p)
-                                            } else {
-                                                print("❌ CoreML output is NIL")
-                                            }
-
-                                            DataLogger.shared.append(sample: sample, label: "normal")
-                                            baseline.add(sample: sample)
-                                            BaselineStore.shared.saveBaseline(baseline)
-                                            baselineStartDate = BaselineStore.shared.saveStartDateIfNeeded()
-                                            HealthDataLogger.shared.updateLatest(sample: sample)
-
-                                            if baselineComplete() {
-                                                let baseRisk = scorer.score(sample: sample, baseline: baseline, includeDetails: false)
-                                                let blended = blendedScore(zScore: baseRisk.score0to100, mlOffProb: mlOffProb)
-                                                let blendedRisk = HydrationRisk(
-                                                    score0to100: blended,
-                                                    level: blended < 35 ? .low : (blended < 70 ? .moderate : .high),
-                                                    details: baseRisk.details
-                                                )
-                                                let improved = post.process(raw: blendedRisk, sample: sample)
-                                                recordScore(improved.score0to100)
-                                                lastCheckTime = Date()
-                                                latestRisk = improved
-                                                statusText = "Scored. Baseline n=\(baseline.hr.n)"
-
-                                                if improved.level == .high {
-                                                    diagLog.log("NOTIFY: level=high score=\(improved.score0to100)")
-                                                    NotificationManager.shared.sendDehydrationAlert(
-                                                        score: improved.score0to100,
-                                                        level: improved.level
-                                                    )
-                                                }
-                                            } else {
-                                                latestRisk = nil
-                                                statusText = "Baseline building… Day \(baselineDay())/14 (n=\(baseline.hr.n))"
-                                            }
+                            if !useSimulator {
+                                Card("Health Metrics") {
+                                    VStack(alignment: .leading, spacing: 12) {
+                                        Text("Latest readings compared with your personal baseline")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 145), spacing: 10)], spacing: 10) {
+                                            healthMetricCard(title: "Heart Rate", symbol: "heart.fill", value: heartRate, unit: "bpm", baselineValue: baseline.hr.n > 0 ? baseline.hr.mean : nil, tint: .pink, decimals: 0)
+                                            healthMetricCard(title: "HRV", symbol: "waveform.path.ecg", value: hrv, unit: "ms", baselineValue: baseline.hrv.n > 0 ? baseline.hrv.mean : nil, tint: .blue, decimals: 1)
+                                            healthMetricCard(title: "Resting HR", symbol: "heart.text.square.fill", value: restingHeartRate, unit: "bpm", baselineValue: baseline.rhr.n > 0 ? baseline.rhr.mean : nil, tint: .orange, decimals: 0)
+                                            activityMetricCard(lastActivity)
                                         }
                                     }
                                 }
+                            }
 
-                                Button("Reset Baseline") {
-                                    BaselineStore.shared.reset()
-                                    baseline = HydrationBaseline()
-                                    baselineStartDate = nil
-                                    latestRisk = nil
-                                    statusText = "Baseline reset."
-                                }
-
-                                Button("Force Backfill Risk Score History") {
-                                    backfillRiskScoreHistory()
+                            Card("Baseline") {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    Text("Day \(baselineDay()) / 14")
+                                        .font(.subheadline.weight(.semibold))
+                                    ProgressView(value: baselineProgress())
+                                        .tint(.blue)
+                                    Text(baselineComplete() ? "Baseline complete " : "Building baseline for personalization…")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
                                 }
                             }
                         }
                         .padding(.horizontal, 16)
-                        .padding(.top, 12)
+                        .padding(.top, 68)
                         .padding(.bottom, 28)
                         .frame(maxWidth: .infinity)
                     }
                 } else {
-                    HistoryView(entries: allScoreHistory, range: historyRange)
+                    HistoryView(entries: allScoreHistory, range: historyRange, aggregationLevel: aggregationLevel)
                 }
             }
-            .navigationTitle(selectedTab == 0 ? "" : "Score History")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                Picker("Tab", selection: $selectedTab) {
+                    Text("Current").tag(0)
+                    Text("History").tag(1)
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal, 18)
+                .padding(.top, 6)
+                .padding(.bottom, 0)
+                .background(.ultraThinMaterial)
+                .overlay(alignment: .top) {
+                    Rectangle()
+                        .fill(.primary.opacity(0.08))
+                        .frame(height: 0.5)
+                }
+            }
+            .toolbar(.hidden, for: .navigationBar)
+            .overlay(alignment: .top) {
+                HStack(spacing: 12) {
+                    Text("Hydrasense")
+                        .font(.system(size: 28, weight: .regular, design: .rounded))
+                        .foregroundStyle(.primary)
+                        .accessibilityAddTraits(.isHeader)
+
+                    Spacer(minLength: 8)
+
+                    StatusPill(
+                        text: useSimulator ? "Simulator" : "HealthKit",
+                        systemImage: useSimulator ? "sparkles" : "heart.fill",
+                        color: useSimulator ? .purple : .pink
+                    )
+
                     Button {
                         showSettings = true
                     } label: {
                         Image(systemName: "gearshape")
+                            .font(.system(size: 17, weight: .medium))
+                            .frame(width: 36, height: 36)
+                            .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.primary)
+                    .accessibilityLabel("Settings")
+                }
+                .padding(.horizontal, 16)
+                .frame(height: 60)
+                .frame(maxWidth: .infinity)
+                .background(.ultraThinMaterial)
+                .overlay(alignment: .bottom) {
+                    Rectangle()
+                        .fill(.primary.opacity(0.08))
+                        .frame(height: 0.5)
                 }
             }
             .sheet(isPresented: $showSettings) {
                 SettingsSheet(
                     showSettings: $showSettings,
                     statusText: $statusText,
+                    useSimulator: $useSimulator,
                     showResetConfirm: $showResetConfirm,
                     historyRangeRawValue: $historyRangeRawValue,
+                    aggregationLevelRawValue: $aggregationLevelRawValue,
                     onShowCSV: {
                         statusText = DataLogger.shared.exportPath()
                     },
@@ -1915,11 +1972,98 @@ struct ContentView: View {
                     onTestNotification: {
                         NotificationManager.shared.sendDehydrationAlert(score: 99, level: .high)
                     },
+                    onBuildBaseline: {
+                        statusText = "Building baseline from last 14 days..."
+                        healthKitManager.buildBaselineFromLastDays(days: 14) { newBaseline, daysUsed in
+                            guard let newBaseline = newBaseline else {
+                                statusText = "Not enough Health data to build baseline."
+                                return
+                            }
+                            baseline = newBaseline
+                            BaselineStore.shared.saveBaseline(baseline)
+                            let start = Calendar.current.date(byAdding: .day, value: -14, to: Date())!
+                            baselineStartDate = start
+                            UserDefaults.standard.set(start, forKey: "hydrasense.baselineStart")
+                            latestRisk = nil
+                            statusText = "Baseline built from \(daysUsed) days ✅"
+                        }
+                    },
+                    onReadHealthKit: {
+                        statusText = "Fetching vitals..."
+                        healthKitManager.fetchLatestVitals { sample in
+                            DispatchQueue.main.async {
+                                guard let sample = sample else {
+                                    statusText = "No HealthKit samples found."
+                                    return
+                                }
+                                debugPrintSample(sample, tag: "HK Manual Read")
+                                heartRate = sample.heartRateBPM
+                                hrv = sample.hrvMS
+                                restingHeartRate = sample.restingHeartRateBPM
+                                if !isValidForML(sample) {
+                                    print("⚠️ sample fails sanity checks; skipping ML", sample)
+                                    mlOffProb = nil
+                                } else {
+                                    mlOffProb = MLPredictor.shared.offProbability(sample: sample)
+                                }
+                                debugMLText = mlOffProb == nil ? "ML: nil" : String(format: "ML: %.3f", mlOffProb!)
+                                print("📥 CoreML INPUTS",
+                                      "hr=\(sample.heartRateBPM)",
+                                      "hrv=\(sample.hrvMS)",
+                                      "rhr=\(sample.restingHeartRateBPM)")
+                                if let p = mlOffProb {
+                                    print("✅ CoreML output offProbability =", p)
+                                } else {
+                                    print("❌ CoreML output is NIL")
+                                }
+                                DataLogger.shared.append(sample: sample, label: "normal")
+                                baseline.add(sample: sample)
+                                BaselineStore.shared.saveBaseline(baseline)
+                                baselineStartDate = BaselineStore.shared.saveStartDateIfNeeded()
+                                HealthDataLogger.shared.updateLatest(sample: sample)
+                                if baselineComplete() {
+                                    let baseRisk = scorer.score(sample: sample, baseline: baseline, includeDetails: false)
+                                    let blended = blendedScore(zScore: baseRisk.score0to100, mlOffProb: mlOffProb)
+                                    let blendedRisk = HydrationRisk(
+                                        score0to100: blended,
+                                        level: blended < 35 ? .low : (blended < 70 ? .moderate : .high),
+                                        details: baseRisk.details
+                                    )
+                                    let improved = post.process(raw: blendedRisk, sample: sample)
+                                    recordScore(improved.score0to100)
+                                    lastCheckTime = Date()
+                                    latestRisk = improved
+                                    PhoneConnectivityManager.shared.sendRiskScore(
+                                        score: improved.score0to100,
+                                        riskLevel: improved.level.rawValue,
+                                        sampleDate: sample.timestamp,
+                                        isSimulator: false
+                                    )
+                                    statusText = "Scored"
+                                    if improved.level == .high {
+                                        diagLog.log("NOTIFY: level=high score=\(improved.score0to100)")
+                                        NotificationManager.shared.sendDehydrationAlert(
+                                            score: improved.score0to100,
+                                            level: improved.level
+                                        )
+                                    }
+                                } else {
+                                    latestRisk = nil
+                                    PhoneConnectivityManager.shared.clearRiskScore(isSimulator: false)
+                                    statusText = "Baseline building… Day \(baselineDay())/14"
+                                }
+                            }
+                        }
+                    },
+                    onBackfillHistory: {
+                        backfillRiskScoreHistory()
+                    },
                     onResetBaseline: {
                         BaselineStore.shared.reset()
                         baseline = HydrationBaseline()
                         baselineStartDate = nil
                         latestRisk = nil
+                        PhoneConnectivityManager.shared.clearRiskScore(isSimulator: useSimulator)
                         statusText = "Baseline reset."
                     }
                 )
@@ -1954,6 +2098,10 @@ struct ContentView: View {
             }
             .onAppear {
                 PhoneConnectivityManager.shared.activate()
+                if !aggregationDefaultUpdated {
+                    aggregationLevelRawValue = AggregationLevel.weekly.rawValue
+                    aggregationDefaultUpdated = true
+                }
                 DebugSessionLog.onTrace = { line in
                     debugTraceLines.append(line)
                     if debugTraceLines.count > 24 {
@@ -1990,15 +2138,43 @@ struct ContentView: View {
                 }
                 // Query keeps running in background — intentionally no stop here.
             }
+            .onChange(of: useSimulator) { newValue in
+                PhoneConnectivityManager.shared.clearRiskScore(isSimulator: newValue)
+                if newValue {
+                    enterSimulatorMode()
+                } else {
+                    latestRisk = nil
+                    debugMLText = ""
+                    realScoreHistory.removeAll()
+                    post = RiskPostProcessor()
+                    lastCheckTime = nil
+                    lastRefreshTime = nil
+                    lastHRDate = nil
+                    lastSeenHRDate = nil
+                    simExplanation = nil
+                    enterRealMode()
+                }
+            }
         }
     }
 }
-
+enum AggregationLevel: String, CaseIterable, Identifiable {
+    case all = "All Entries"
+    case daily = "Daily Average"
+    case weekly = "Weekly Average"
+    var id: String { rawValue }
+}
 // MARK: - HistoryView
 
 private struct HistoryView: View {
     let entries: [ScoreHistoryEntry]
     let range: HistoryRange
+    let aggregationLevel: AggregationLevel
+
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
+    @State private var visibleDays = 90.0
+    @State private var initialVisibleDays = 90.0
+    @State private var scrollPosition = Date()
 
     private var filteredEntries: [ScoreHistoryEntry] {
         entries
@@ -2006,82 +2182,308 @@ private struct HistoryView: View {
             .sorted { $0.date < $1.date }
     }
 
-    /// Consecutive identical scores are one continuous state, not separate insights.
-    /// Keep the first and last timestamps so the user can still see how long it lasted.
     private var displayedEntries: [DisplayScoreHistoryEntry] {
-        filteredEntries.reduce(into: [DisplayScoreHistoryEntry]()) { result, entry in
-            guard let last = result.last,
-                  last.score == entry.score,
-                  last.riskLevel == entry.riskLevel else {
-                result.append(DisplayScoreHistoryEntry(
-                    id: entry.id,
-                    score: entry.score,
-                    riskLevel: entry.riskLevel,
-                    firstDate: entry.date,
-                    lastDate: entry.date,
-                    readingCount: 1
-                ))
-                return
+        switch aggregationLevel {
+        case .all:
+            return filteredEntries.reduce(into: [DisplayScoreHistoryEntry]()) { result, entry in
+                guard let last = result.last,
+                      last.score == Double(entry.score),
+                      last.riskLevel == entry.riskLevel else {
+                    result.append(DisplayScoreHistoryEntry(
+                        id: entry.id, score: Double(entry.score), riskLevel: entry.riskLevel,
+                        firstDate: entry.date, lastDate: entry.date, readingCount: 1
+                    ))
+                    return
+                }
+                result[result.count - 1] = DisplayScoreHistoryEntry(
+                    id: last.id, score: last.score, riskLevel: last.riskLevel,
+                    firstDate: last.firstDate, lastDate: entry.date,
+                    readingCount: last.readingCount + 1
+                )
             }
-
-            result[result.count - 1] = DisplayScoreHistoryEntry(
-                id: last.id,
-                score: last.score,
-                riskLevel: last.riskLevel,
-                firstDate: last.firstDate,
-                lastDate: entry.date,
-                readingCount: last.readingCount + 1
-            )
+        case .daily, .weekly:
+            let calendar = Calendar.current
+            let grouped = Dictionary(grouping: filteredEntries) { entry -> Date in
+                let component: Calendar.Component = aggregationLevel == .daily ? .day : .weekOfYear
+                return calendar.dateInterval(of: component, for: entry.date)?.start ?? calendar.startOfDay(for: entry.date)
+            }
+            return grouped.keys.sorted().compactMap { date in
+                guard let bucket = grouped[date], !bucket.isEmpty else { return nil }
+                let average = Double(bucket.reduce(0) { $0 + $1.score }) / Double(bucket.count)
+                let level: HydrationRiskLevel = average < 35 ? .low : (average < 70 ? .moderate : .high)
+                return DisplayScoreHistoryEntry(
+                    id: UUID(), score: average, riskLevel: level,
+                    firstDate: bucket.first!.date, lastDate: bucket.last!.date,
+                    readingCount: bucket.count
+                )
+            }
         }
     }
 
+    private var visibleMonthLabel: String {
+        let calendar = Calendar.current
+        let visibleEnd = calendar.date(byAdding: .second, value: Int(visibleDays * 86_400), to: scrollPosition) ?? scrollPosition
+        let startParts = calendar.dateComponents([.month, .year], from: scrollPosition)
+        let endParts = calendar.dateComponents([.month, .year], from: visibleEnd)
+        if startParts.month == endParts.month && startParts.year == endParts.year {
+            return scrollPosition.formatted(.dateTime.month(.wide).year())
+        }
+
+        let startMonth = scrollPosition.formatted(.dateTime.month(.wide))
+        let endMonth = visibleEnd.formatted(.dateTime.month(.wide))
+        if startParts.year == endParts.year, let year = startParts.year {
+            return "\(startMonth) – \(endMonth) \(year)"
+        }
+        return "\(scrollPosition.formatted(.dateTime.month(.wide).year())) – \(visibleEnd.formatted(.dateTime.month(.wide).year()))"
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            if filteredEntries.isEmpty {
-                Text("No scores recorded in the selected range.")
-                    .foregroundStyle(.secondary)
-            } else {
-                Chart {
-                    ForEach(displayedEntries) { entry in
-                        PointMark(
-                            x: .value("Date", entry.lastDate),
-                            y: .value("Score", entry.score)
-                        ).foregroundStyle(by: .value("Level", entry.riskLevel.rawValue))
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 20) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("YOUR TRENDS")
+                        .font(.caption.weight(.bold))
+                        .tracking(1.2)
+                        .foregroundStyle(.blue)
+                    Text("History")
+                        .font(.largeTitle.weight(.bold))
+                    Text("A clearer look at your hydration risk over time.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.top, 62)
+
+                if let latest = displayedEntries.last {
+                    HStack(spacing: 12) {
+                        summaryCard(
+                            title: aggregationLevel == .all ? "LATEST SCORE" : "LATEST AVERAGE",
+                            value: latest.score.formatted(.number.precision(.fractionLength(aggregationLevel == .all ? 0 : 1))),
+                            detail: latest.riskLevel.rawValue.capitalized,
+                            tint: color(for: latest.riskLevel),
+                            symbol: "waveform.path.ecg"
+                        )
+                        summaryCard(
+                            title: "DATA POINTS",
+                            value: displayedEntries.count.formatted(),
+                            detail: aggregationLevel.rawValue,
+                            tint: .blue,
+                            symbol: "chart.xyaxis.line"
+                        )
                     }
                 }
-                .frame(height: 160)
-                .padding(.bottom, 20)
-                List(displayedEntries.reversed()) { entry in
-                    HStack {
-                        VStack(alignment: .leading) {
-                            Text("Score: \(entry.score)")
-                                .font(.body.weight(.semibold))
-                            Text(entry.riskLevel.rawValue.capitalized)
-                                .font(.caption)
-                                .foregroundStyle(color(for: entry.riskLevel))
-                        }
-                        Spacer()
-                        VStack(alignment: .trailing, spacing: 2) {
-                            if entry.readingCount > 1 {
-                                Text("\(entry.readingCount) readings")
-                                    .font(.caption.weight(.medium))
-                            }
-                            Text(entry.firstDate, style: .date)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            if !Calendar.current.isDate(entry.firstDate, inSameDayAs: entry.lastDate) {
-                                Text("to \(entry.lastDate.formatted(date: .abbreviated, time: .omitted))")
-                                    .font(.caption2)
+
+                if filteredEntries.isEmpty {
+                    ContentUnavailableView(
+                        "No history yet",
+                        systemImage: "chart.xyaxis.line",
+                        description: Text("Scores in the selected date range will appear here.")
+                    )
+                    .frame(maxWidth: .infinity, minHeight: 220)
+                } else {
+                    VStack(alignment: .leading, spacing: 14) {
+                        HStack(alignment: .center) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("Risk score trend")
+                                    .font(.headline)
+                                Text(aggregationLevel.rawValue)
+                                    .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
+                            Spacer()
+                            HStack(spacing: 6) {
+                                zoomButton("Zoom out", systemImage: "minus.magnifyingglass", factor: 1.5)
+                                zoomButton("Zoom in", systemImage: "plus.magnifyingglass", factor: 1 / 1.5)
+                            }
+                        }
+
+                        HStack(spacing: 8) {
+                            Image(systemName: "calendar")
+                                .font(.subheadline.weight(.semibold))
+                            Text(visibleMonthLabel)
+                                .font(.subheadline.weight(.semibold))
+                                .contentTransition(.numericText())
+                            Spacer()
+                        }
+                        .foregroundStyle(.blue)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                        .background(.blue.opacity(0.09), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+
+                        Chart {
+                            ForEach(displayedEntries) { entry in
+                                LineMark(
+                                    x: .value("Date", entry.lastDate),
+                                    y: .value("Score", entry.score)
+                                )
+                                .foregroundStyle(Color.blue.gradient)
+                                .lineStyle(StrokeStyle(lineWidth: 2.5, lineCap: .round, lineJoin: .round))
+
+                                PointMark(
+                                    x: .value("Date", entry.lastDate),
+                                    y: .value("Score", entry.score)
+                                )
+                                .foregroundStyle(color(for: entry.riskLevel))
+                                .symbolSize(aggregationLevel == .all ? 20 : 48)
+                            }
+                        }
+                        .chartYScale(domain: 0...100)
+                        .chartXAxis {
+                            AxisMarks(values: .automatic(desiredCount: 4)) { _ in
+                                AxisGridLine().foregroundStyle(.secondary.opacity(0.12))
+                                AxisTick().foregroundStyle(.secondary.opacity(0.4))
+                                AxisValueLabel(format: .dateTime.month(.abbreviated).day())
+                                    .font(.caption2)
+                            }
+                        }
+                        .chartYAxis {
+                            AxisMarks(values: [0, 25, 50, 75, 100]) { _ in
+                                AxisGridLine().foregroundStyle(.secondary.opacity(0.14))
+                                AxisValueLabel().font(.caption2)
+                            }
+                        }
+                        .chartScrollableAxes(.horizontal)
+                        .chartXVisibleDomain(length: visibleDays * 86_400)
+                        .chartScrollPosition(x: $scrollPosition)
+                        .frame(height: verticalSizeClass == .compact ? 240 : 330)
+                        .contentShape(Rectangle())
+                        .simultaneousGesture(
+                            MagnifyGesture()
+                                .onChanged { value in
+                                    visibleDays = min(365, max(14, initialVisibleDays / Double(value.magnification)))
+                                }
+                                .onEnded { _ in initialVisibleDays = visibleDays }
+                        )
+
+                        HStack(spacing: 14) {
+                            riskLegend("Low", tint: .green)
+                            riskLegend("Moderate", tint: .orange)
+                            riskLegend("High", tint: .red)
+                            Spacer(minLength: 0)
+                        }
+
+                        Text("Swipe to browse · Pinch or use the zoom buttons")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(16)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 22, style: .continuous)
+                            .strokeBorder(.primary.opacity(0.06), lineWidth: 1)
+                    }
+
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("Recent history")
+                            .font(.title3.weight(.bold))
+                        Spacer()
+                        Text("\(displayedEntries.count) periods")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.top, 2)
+
+                    LazyVStack(spacing: 9) {
+                        ForEach(displayedEntries.reversed()) { entry in
+                            HStack(spacing: 12) {
+                                RoundedRectangle(cornerRadius: 3)
+                                    .fill(color(for: entry.riskLevel))
+                                    .frame(width: 5, height: 42)
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(aggregationLevel == .all
+                                         ? "Score \(Int(entry.score.rounded()))"
+                                         : "Average \(entry.score.formatted(.number.precision(.fractionLength(1))))")
+                                        .font(.subheadline.weight(.semibold))
+                                    HStack(spacing: 5) {
+                                        Text(entry.riskLevel.rawValue.capitalized)
+                                        if entry.readingCount > 1 {
+                                            Text("· \(entry.readingCount) readings")
+                                        }
+                                    }
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                VStack(alignment: .trailing, spacing: 3) {
+                                    Text(entry.firstDate.formatted(date: .abbreviated, time: .omitted))
+                                    if !Calendar.current.isDate(entry.firstDate, inSameDayAs: entry.lastDate) {
+                                        Text("to \(entry.lastDate.formatted(date: .abbreviated, time: .omitted))")
+                                    }
+                                }
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            }
+                            .padding(.horizontal, 13)
+                            .padding(.vertical, 10)
+                            .background(.background.opacity(0.75), in: RoundedRectangle(cornerRadius: 15, style: .continuous))
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 15, style: .continuous)
+                                    .strokeBorder(.primary.opacity(0.05), lineWidth: 1)
+                            }
                         }
                     }
-                    .padding(.vertical, 4)
                 }
             }
+            .frame(maxWidth: 760, alignment: .leading)
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
         }
-        .padding(.horizontal, 18)
-        .navigationTitle("Score History")
+        .background(Color(uiColor: .systemGroupedBackground))
+        .navigationTitle("History")
+        .navigationBarTitleDisplayMode(.inline)
+        .onChange(of: aggregationLevel) { _, _ in
+            visibleDays = 90
+            initialVisibleDays = 90
+            scrollPosition = Date()
+        }
+    }
+
+    private func summaryCard(title: String, value: String, detail: String, tint: Color, symbol: String) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Image(systemName: symbol)
+                    .foregroundStyle(tint)
+                Text(title)
+                    .font(.caption2.weight(.bold))
+                    .tracking(0.5)
+                    .foregroundStyle(.secondary)
+            }
+            Text(value)
+                .font(.system(size: 29, weight: .bold, design: .rounded))
+                .contentTransition(.numericText())
+            Text(detail)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(tint)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(.background.opacity(0.78), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .strokeBorder(.primary.opacity(0.05), lineWidth: 1)
+        }
+    }
+
+    private func zoomButton(_ label: String, systemImage: String, factor: Double) -> some View {
+        Button {
+            visibleDays = min(365, max(14, visibleDays * factor))
+            initialVisibleDays = visibleDays
+        } label: {
+            Image(systemName: systemImage)
+                .font(.subheadline.weight(.semibold))
+                .frame(width: 34, height: 34)
+                .background(.background.opacity(0.85), in: Circle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.primary)
+        .accessibilityLabel(label)
+    }
+
+    private func riskLegend(_ title: String, tint: Color) -> some View {
+        HStack(spacing: 5) {
+            Circle().fill(tint).frame(width: 7, height: 7)
+            Text(title).font(.caption2).foregroundStyle(.secondary)
+        }
     }
     private func color(for level: HydrationRiskLevel) -> Color {
         switch level {
@@ -2097,24 +2499,41 @@ private struct HistoryView: View {
 private struct SettingsSheet: View {
     @Binding var showSettings: Bool
     @Binding var statusText: String
+    @Binding var useSimulator: Bool
     @Binding var showResetConfirm: Bool
     @Binding var historyRangeRawValue: String
+    @Binding var aggregationLevelRawValue: String
 
     let onShowCSV: () -> Void
     let onCheckCSV: () -> Void
     let onTestNotification: () -> Void
+    let onBuildBaseline: () -> Void
+    let onReadHealthKit: () -> Void
+    let onBackfillHistory: () -> Void
     let onResetBaseline: () -> Void
 
     var body: some View {
         NavigationStack {
             List {
+                Section("Mode") {
+                    Toggle("Use Simulator", isOn: $useSimulator)
+                    Text(useSimulator ? "Simulator readings are shown on the Current tab." : "Current readings come from HealthKit.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
                 Section("History") {
                     Picker("Show history from", selection: $historyRangeRawValue) {
                         ForEach(HistoryRange.allCases) { range in
                             Text(range.rawValue).tag(range.rawValue)
                         }
                     }
-                    Text("Repeated consecutive scores are combined into one entry.")
+                    Picker("Show", selection: $aggregationLevelRawValue) {
+                        ForEach(AggregationLevel.allCases) { level in
+                            Text(level.rawValue).tag(level.rawValue)
+                        }
+                    }
+                    Text("Repeated consecutive scores are combined in All Entries. Daily and weekly views show averages.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -2122,9 +2541,6 @@ private struct SettingsSheet: View {
                 Section("Data") {
                     Button("Show Training CSV Path") { onShowCSV() }
                     Button("Check CSV Exists") { onCheckCSV() }
-                    Button("Force Backfill Risk Score History") {
-                        onBackfillHistory?()
-                    }
                 }
 
                 Section("Notifications") {
@@ -2132,6 +2548,9 @@ private struct SettingsSheet: View {
                 }
 
                 Section("Important") {
+                    Button("Build Baseline from HealthKit (Last 14 Days)", action: onBuildBaseline)
+                    Button("Read HealthKit (Real) → Score", action: onReadHealthKit)
+                    Button("Force Backfill Risk Score History", action: onBackfillHistory)
                     Button(role: .destructive) {
                         showResetConfirm = true
                     } label: {
@@ -2168,7 +2587,6 @@ private struct SettingsSheet: View {
         }
     }
 
-    var onBackfillHistory: (() -> Void)? = nil
 }
 
 private struct Card<Content: View>: View {
@@ -2262,33 +2680,53 @@ private struct RiskBadge: View {
     let score: Int
 
     var body: some View {
-        let (color, label, icon): (Color, String, String) = {
+        let (color, label): (Color, String) = {
             switch level {
-            case .low: return (.green, "Low", "checkmark.seal.fill")
-            case .moderate: return (.orange, "Moderate", "exclamationmark.triangle.fill")
-            case .high: return (.red, "High", "exclamationmark.octagon.fill")
+            case .low: return (.green, "Low")
+            case .moderate: return (.orange, "Moderate")
+            case .high: return (.red, "High")
             }
         }()
 
         HStack(spacing: 10) {
-            Image(systemName: icon)
-                .foregroundStyle(color)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Dehydration Risk")
-                    .font(.caption)
+            VStack(alignment: .trailing, spacing: 4) {
+                Text("HYDRATION")
+                    .font(.caption.weight(.bold))
+                    .tracking(0.6)
                     .foregroundStyle(.secondary)
-                Text("\(label) • \(score)")
-                    .font(.headline)
+                Text("RISK")
+                    .font(.caption.weight(.bold))
+                    .tracking(0.6)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .trailing)
+
+            ZStack {
+                Circle()
+                    .stroke(color.opacity(0.14), lineWidth: 11)
+                Circle()
+                    .trim(from: 0, to: CGFloat(min(max(score, 0), 100)) / 100)
+                    .stroke(color, style: StrokeStyle(lineWidth: 11, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                Text("\(score)")
+                    .font(.system(size: 36, weight: .bold, design: .rounded).monospacedDigit())
                     .foregroundStyle(.primary)
             }
-            Spacer()
+            .frame(width: 116, height: 116)
+            .accessibilityLabel("Risk score \(score) out of 100")
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(label)
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(color)
+                Text("OUT OF 100")
+                    .font(.caption2.weight(.bold))
+                    .tracking(0.4)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(12)
-        .background(color.opacity(0.10))
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(color.opacity(0.25), lineWidth: 1)
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .frame(maxWidth: .infinity, alignment: .center)
+        .padding(.vertical, 4)
     }
 }
