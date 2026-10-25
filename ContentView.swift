@@ -77,10 +77,23 @@ private enum DebugSessionLog {
 }
 // #endregion
 
-class HealthKitManager: ObservableObject {
+class HealthKitManager: NSObject, ObservableObject {
+
     private var hrUpdateQuery: HKAnchoredObjectQuery?
     private var hrAnchor: HKQueryAnchor?
     let healthStore = HKHealthStore()
+
+    override init() {
+        super.init()
+
+        healthStore.workoutSessionMirroringStartHandler = { [weak self] session in
+            self?.handleMirroredWorkoutSession(session)
+        }
+    }
+    private var mirroredWorkoutSession: HKWorkoutSession?
+    private var liveWatchHRHandler: ((Double, Date) -> Void)?
+    private(set) var isLiveWatchWorkoutRunning = false
+
 
     private var lastKnownHRV: (value: Double, date: Date)?
     private var lastKnownRHR: (value: Double, date: Date)?
@@ -88,7 +101,7 @@ class HealthKitManager: ObservableObject {
 
     // MARK: - Observer Query for Live Updates
     private var hrObserverQuery: HKObserverQuery?
-    
+
     /// Starts a live observer for heart rate. Calls `onChange` when new data arrives.
     func startHeartRateObserver(onChange: @escaping () -> Void) {
         let type = HKQuantityType.quantityType(forIdentifier: .heartRate)!
@@ -192,6 +205,35 @@ class HealthKitManager: ObservableObject {
         }
     }
 
+    func startLiveWatchHeartRate(
+        onNew: @escaping (Double, Date) -> Void
+    ) {
+        liveWatchHRHandler = onNew
+
+        let configuration = HKWorkoutConfiguration()
+        configuration.activityType = .other
+        configuration.locationType = .unknown
+
+        print("Starting Apple Watch live workout...")
+
+        healthStore.startWatchApp(with: configuration) { success, error in
+            if let error = error {
+                print("❌ Could not launch Watch workout:", error.localizedDescription)
+                return
+            }
+
+            print("⌚ Watch workout app launched:", success)
+        }
+    }
+    private func handleMirroredWorkoutSession(_ session: HKWorkoutSession) {
+        print("📡 Received mirrored Watch workout session")
+
+        mirroredWorkoutSession = session
+        session.delegate = self
+        isLiveWatchWorkoutRunning = true
+
+        print("✅ Mirrored Watch session connected")
+    }
     func fetchLatestHeartRate(completion: @escaping (Double?) -> Void) {
         let heartRateType = HKQuantityType.quantityType(forIdentifier: .heartRate)!
         let sortDescriptor = NSSortDescriptor(key: HKSampleSortIdentifierEndDate, ascending: false)
@@ -654,6 +696,149 @@ class HealthKitManager: ObservableObject {
         healthStore.execute(query)
     }
 }
+extension HealthKitManager: HKWorkoutSessionDelegate {
+
+    func workoutSession(
+        _ workoutSession: HKWorkoutSession,
+        didChangeTo toState: HKWorkoutSessionState,
+        from fromState: HKWorkoutSessionState,
+        date: Date
+    ) {
+        print("⌚ Workout state:", fromState.rawValue, "→", toState.rawValue)
+    }
+
+    func workoutSession(
+        _ workoutSession: HKWorkoutSession,
+        didFailWithError error: Error
+    ) {
+        print("❌ Watch workout failed:", error.localizedDescription)
+
+        DispatchQueue.main.async {
+            self.isLiveWatchWorkoutRunning = false
+        }
+    }
+
+    func workoutSession(
+        _ workoutSession: HKWorkoutSession,
+        didGenerate event: HKWorkoutEvent
+    ) {
+        print("⌚ Workout event:", event)
+    }
+
+    func workoutSession(
+        _ workoutSession: HKWorkoutSession,
+        didBeginActivityWith workoutConfiguration: HKWorkoutConfiguration,
+        date: Date
+    ) {
+        print("⌚ Watch workout activity began")
+    }
+
+    func workoutSession(
+        _ workoutSession: HKWorkoutSession,
+        didEndActivityWith workoutConfiguration: HKWorkoutConfiguration,
+        date: Date
+    ) {
+        print("⌚ Watch workout activity ended")
+    }
+
+    func workoutSession(
+        _ workoutSession: HKWorkoutSession,
+        didDisconnectFromRemoteDeviceWithError error: Error?
+    ) {
+        print(
+            "❌ Watch disconnected:",
+            error?.localizedDescription ?? "no error"
+        )
+
+        DispatchQueue.main.async {
+            self.isLiveWatchWorkoutRunning = false
+        }
+    }
+
+    func workoutSession(
+        _ workoutSession: HKWorkoutSession,
+        didReceiveDataFromRemoteWorkoutSession data: [Data]
+    ) {
+        for packet in data {
+            do {
+                let decoded = try JSONDecoder().decode(
+                    LiveHeartRatePacket.self,
+                    from: packet
+                )
+
+                print(
+                    "❤️ LIVE WATCH HR:",
+                    decoded.heartRate,
+                    "at",
+                    decoded.timestamp
+                )
+
+                DispatchQueue.main.async {
+                    self.liveWatchHRHandler?(
+                        decoded.heartRate,
+                        decoded.timestamp
+                    )
+                }
+
+            } catch {
+                print(
+                    "❌ Could not decode Watch HR packet:",
+                    error.localizedDescription
+                )
+            }
+        }
+    }
+}
+// MARK: - ScoreHistoryEntry
+
+struct ScoreHistoryEntry: Codable, Identifiable {
+    let id: UUID
+    let score: Int
+    let date: Date
+    let riskLevel: HydrationRiskLevel
+
+    init(score: Int, date: Date, riskLevel: HydrationRiskLevel) {
+        self.id = UUID()
+        self.score = score
+        self.date = date
+        self.riskLevel = riskLevel
+    }
+}
+
+private enum HistoryRange: String, CaseIterable, Identifiable {
+    case oneWeek = "1 Week"
+    case oneMonth = "1 Month"
+    case twoMonths = "2 Months"
+    case sixMonths = "6 Months"
+    case allTime = "All History"
+
+    var id: String { rawValue }
+
+    func includes(_ date: Date, relativeTo now: Date = Date()) -> Bool {
+        guard self != .allTime else { return true }
+
+        let calendar = Calendar.current
+        let components: DateComponents
+        switch self {
+        case .oneWeek: components = DateComponents(day: -7)
+        case .oneMonth: components = DateComponents(month: -1)
+        case .twoMonths: components = DateComponents(month: -2)
+        case .sixMonths: components = DateComponents(month: -6)
+        case .allTime: return true
+        }
+
+        return date >= (calendar.date(byAdding: components, to: now) ?? .distantPast)
+    }
+}
+
+private struct DisplayScoreHistoryEntry: Identifiable {
+    let id: UUID
+    let score: Int
+    let riskLevel: HydrationRiskLevel
+    let firstDate: Date
+    let lastDate: Date
+    let readingCount: Int
+}
 
 // MARK: - ContentView
 
@@ -697,6 +882,12 @@ struct ContentView: View {
     @State private var pollCount: Int = 0
     @State private var lastPollFiredAt: Date?
 
+    @State private var simExplanation: String? = nil
+
+    @State private var selectedTab: Int = 0
+    @State private var allScoreHistory: [ScoreHistoryEntry] = []
+    @AppStorage("hydrasense.historyRange") private var historyRangeRawValue = HistoryRange.twoMonths.rawValue
+
     @Environment(\.scenePhase) private var scenePhase
 
     private let uiTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
@@ -710,7 +901,124 @@ struct ContentView: View {
         useSimulator ? simulatorScoreHistory : realScoreHistory
     }
 
+    private var historyRange: HistoryRange {
+        HistoryRange(rawValue: historyRangeRawValue) ?? .twoMonths
+    }
+
+    // MARK: - Score History Persistence
+
+    private func saveScoreHistory() {
+        if let data = try? JSONEncoder().encode(allScoreHistory) {
+            UserDefaults.standard.set(data, forKey: "hydrasense.allScoreHistory")
+        }
+    }
+
+    private func loadScoreHistory() {
+        if let data = UserDefaults.standard.data(forKey: "hydrasense.allScoreHistory"),
+           let loaded = try? JSONDecoder().decode([ScoreHistoryEntry].self, from: data) {
+            allScoreHistory = loaded
+        }
+    }
+
+    // MARK: - Historical Backfill
+    private func backfillRiskScoreHistory() {
+        let daysBack = 14
+        let endDate = Date()
+        guard let startDate = Calendar.current.date(byAdding: .day, value: -daysBack, to: endDate) else { return }
+        let group = DispatchGroup()
+        var hrSamples: [HKQuantitySample] = []
+        var hrvSamples: [HKQuantitySample] = []
+        var rhrSamples: [HKQuantitySample] = []
+        group.enter()
+        healthKitManager.healthStore.execute(HKSampleQuery(
+            sampleType: HKQuantityType.quantityType(forIdentifier: .heartRate)!,
+            predicate: HKQuery.predicateForSamples(withStart: startDate, end: endDate, options: .strictStartDate),
+            limit: HKObjectQueryNoLimit,
+            sortDescriptors: [NSSortDescriptor(key: HKSampleSortIdentifierEndDate, ascending: true)]
+        ) { _, samples, _ in
+            hrSamples = (samples as? [HKQuantitySample]) ?? []
+            print("[Backfill] HR samples found: \(hrSamples.count)")
+            group.leave()
+        })
+        group.enter()
+        healthKitManager.healthStore.execute(HKSampleQuery(
+            sampleType: HKQuantityType.quantityType(forIdentifier: .heartRateVariabilitySDNN)!,
+            predicate: HKQuery.predicateForSamples(withStart: startDate, end: endDate, options: .strictStartDate),
+            limit: HKObjectQueryNoLimit,
+            sortDescriptors: [NSSortDescriptor(key: HKSampleSortIdentifierEndDate, ascending: true)]
+        ) { _, samples, _ in
+            hrvSamples = (samples as? [HKQuantitySample]) ?? []
+            print("[Backfill] HRV samples found: \(hrvSamples.count)")
+            group.leave()
+        })
+        group.enter()
+        healthKitManager.healthStore.execute(HKSampleQuery(
+            sampleType: HKQuantityType.quantityType(forIdentifier: .restingHeartRate)!,
+            predicate: HKQuery.predicateForSamples(withStart: startDate, end: endDate, options: .strictStartDate),
+            limit: HKObjectQueryNoLimit,
+            sortDescriptors: [NSSortDescriptor(key: HKSampleSortIdentifierEndDate, ascending: true)]
+        ) { _, samples, _ in
+            rhrSamples = (samples as? [HKQuantitySample]) ?? []
+            print("[Backfill] RHR samples found: \(rhrSamples.count)")
+            group.leave()
+        })
+        group.notify(queue: .main) {
+            var added = 0
+            let scoredTimestamps: Set<Date> = Set(allScoreHistory.map { $0.date })
+            for hr in hrSamples {
+                let hrDate = hr.endDate
+                guard !scoredTimestamps.contains(where: { abs($0.timeIntervalSince(hrDate)) < 30 }) else { continue }
+                let hrv = hrvSamples.min(by: { abs($0.endDate.timeIntervalSince(hrDate)) < abs($1.endDate.timeIntervalSince(hrDate)) })
+                let rhr = rhrSamples.min(by: { abs($0.endDate.timeIntervalSince(hrDate)) < abs($1.endDate.timeIntervalSince(hrDate)) })
+                let hrvVal = hrv?.quantity.doubleValue(for: HKUnit.second()) ?? 0.0
+                let rhrVal = rhr?.quantity.doubleValue(for: HKUnit(from: "count/min")) ?? 0.0
+                let sample = VitalSample(
+                    timestamp: hrDate,
+                    heartRateBPM: hr.quantity.doubleValue(for: HKUnit(from: "count/min")),
+                    hrvMS: hrvVal * 1000.0,
+                    restingHeartRateBPM: rhrVal
+                )
+                let baseRisk = scorer.score(sample: sample, baseline: baseline, includeDetails: false)
+                let blended = blendedScore(zScore: baseRisk.score0to100, mlOffProb: nil)
+                let riskLevel = blended < 35 ? HydrationRiskLevel.low : (blended < 70 ? .moderate : .high)
+                let entry = ScoreHistoryEntry(score: blended, date: hrDate, riskLevel: riskLevel)
+                allScoreHistory.append(entry)
+                added += 1
+            }
+            allScoreHistory.sort { $0.date < $1.date }
+            saveScoreHistory()
+            print("[Backfill] History entries added: \(added)")
+            print("[Backfill] Total history entries: \(allScoreHistory.count)")
+        }
+    }
+
     // MARK: - Scoring
+
+    private func recordScore(_ score: Int) {
+        if useSimulator {
+            simulatorScoreHistory.append(score)
+            if simulatorScoreHistory.count > 20 {
+                simulatorScoreHistory.removeFirst(simulatorScoreHistory.count - 20)
+            }
+            // For simulator, risk level from latestRisk or approximate from score
+            let riskLevel = latestRisk?.level ?? (score < 35 ? .low : (score < 70 ? .moderate : .high))
+            let entry = ScoreHistoryEntry(score: score, date: Date(), riskLevel: riskLevel)
+            allScoreHistory.append(entry)
+            saveScoreHistory()
+        } else {
+            realScoreHistory.append(score)
+            if realScoreHistory.count > 20 {
+                realScoreHistory.removeFirst(realScoreHistory.count - 20)
+            }
+            // For real data, risk level from latestRisk or approximate from score
+            let riskLevel = latestRisk?.level ?? (score < 35 ? .low : (score < 70 ? .moderate : .high))
+            let entry = ScoreHistoryEntry(score: score, date: Date(), riskLevel: riskLevel)
+            allScoreHistory.append(entry)
+            saveScoreHistory()
+        }
+    }
+
+    // MARK: - Scoring and Notification (unchanged)
 
     private func scoreAndMaybeNotify(sample: VitalSample, activity: ActivityContext? = nil) {
         if skipMLOnce {
@@ -771,7 +1079,7 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Refresh
+    // MARK: - Refresh (unchanged)
 
     private func backgroundRefreshAndScore() {
         diagLog.log("REFRESH START")
@@ -787,7 +1095,12 @@ struct ContentView: View {
         }
 
         healthKitManager.fetchLatestVitalsLenient { sampleOpt in
-            guard let sample = sampleOpt else {
+            let now = Date()
+            let recentWatchSample = LatestSampleStore.shared.latest.flatMap { latest -> VitalSample? in
+                let age = now.timeIntervalSince(latest.timestamp)
+                return (0...120).contains(age) ? latest : nil
+            }
+            guard let fetchedSample = sampleOpt ?? recentWatchSample else {
                 diagLog.log("REFRESH NO VITALS (lenient)")
                 if bgTask != .invalid {
                     UIApplication.shared.endBackgroundTask(bgTask)
@@ -796,6 +1109,9 @@ struct ContentView: View {
                 }
                 return
             }
+            let sample = recentWatchSample.flatMap { latest in
+                latest.timestamp > fetchedSample.timestamp ? latest : nil
+            } ?? fetchedSample
 
             let group = DispatchGroup()
             group.enter()
@@ -854,7 +1170,13 @@ struct ContentView: View {
         healthKitManager.fetchMostRecentHeartRateDetail { hr, date, source in
             Task { @MainActor in
                 guard let hr, let date else { return }
-                liveDisplay.apply(heartRate: hr, timestamp: date, source: source)
+                if !healthKitManager.isLiveWatchWorkoutRunning {
+                    liveDisplay.apply(
+                        heartRate: hr,
+                        timestamp: date,
+                        source: source
+                    )
+                }
                 let age = liveDisplay.sampleAgeSec
                 // #region agent log
                 DebugSessionLog.log(
@@ -884,7 +1206,12 @@ struct ContentView: View {
 
         healthKitManager.fetchLatestVitalsLenient { sampleOpt in
             Task { @MainActor in
-                guard let sample = sampleOpt else {
+                let now = Date()
+                let recentWatchSample = LatestSampleStore.shared.latest.flatMap { latest -> VitalSample? in
+                    let age = now.timeIntervalSince(latest.timestamp)
+                    return (0...120).contains(age) ? latest : nil
+                }
+                guard let fetchedSample = sampleOpt ?? recentWatchSample else {
                     // #region agent log
                     DebugSessionLog.log(
                         hypothesisId: "E",
@@ -900,7 +1227,10 @@ struct ContentView: View {
                     }
                     return
                 }
-
+                // Prefer a newer watch sample only while it is still recent.
+                let sample = recentWatchSample.flatMap { latest in
+                    latest.timestamp > fetchedSample.timestamp ? latest : nil
+                } ?? fetchedSample
                 let sampleAgeSec = Int(Date().timeIntervalSince(sample.timestamp))
                 let tsChanged = lastSeenHRDate.map { $0 != sample.timestamp } ?? true
                 // #region agent log
@@ -918,7 +1248,12 @@ struct ContentView: View {
                 )
                 // #endregion
 
-                liveDisplay.apply(sample: sample, source: liveDisplay.phoneSource)
+                if !healthKitManager.isLiveWatchWorkoutRunning {
+                    liveDisplay.apply(
+                        sample: sample,
+                        source: liveDisplay.phoneSource
+                    )
+                }
                 pollCount = liveDisplay.pollCount
                 lastPollFiredAt = liveDisplay.lastRefreshAt
 
@@ -974,40 +1309,32 @@ struct ContentView: View {
     }
 
     private func startLiveStream() {
-        // #region agent log
-        let hrType = HKQuantityType.quantityType(forIdentifier: .heartRate)!
-        DebugSessionLog.log(
-            hypothesisId: "D",
-            location: "ContentView.startLiveStream",
-            message: isLiveStreamRunning ? "stream already running — fetch only" : "starting live stream",
-            data: [
-                "useSimulator": useSimulator,
-                "isMonitoringActive": isMonitoringActive,
-                "isLiveStreamRunning": isLiveStreamRunning,
-                "hrAuthStatus": healthKitManager.healthStore.authorizationStatus(for: hrType).rawValue
-            ]
-        )
-        // #endregion
+
         if isLiveStreamRunning {
-            refreshNow()
             return
         }
+
         isLiveStreamRunning = true
+
         healthKitManager.stopHeartRateObserver()
         healthKitManager.stopHeartRateLiveUpdates()
-        healthKitManager.startHeartRateObserver {
-            Task { @MainActor in
-                refreshNow()
-            }
-        }
-        healthKitManager.startContinuousHeartRateUpdates { hr, date in
-            Task { @MainActor in
-                applyQuickHRUpdate(hr: hr, date: date)
-                refreshNow()
-            }
-        }
-    }
 
+        healthKitManager.startLiveWatchHeartRate { hr, date in
+            Task { @MainActor in
+                applyQuickHRUpdate(
+                    hr: hr,
+                    date: date
+                )
+
+                // IMPORTANT:
+                // Do not call refreshNow() here.
+                // refreshNow() reads the latest SAVED HealthKit sample,
+                // which can be older than this live Watch reading.
+            }
+        }
+
+        print("HydraSense live Watch stream started")
+    }
     private func stopLiveStream() {
         isLiveStreamRunning = false
         healthKitManager.stopHeartRateObserver()
@@ -1073,6 +1400,7 @@ struct ContentView: View {
         lastHRDate = nil
         lastSeenHRDate = nil
         debugMLText = ""
+        simExplanation = nil
     }
 
     // MARK: - Helpers
@@ -1086,20 +1414,6 @@ struct ContentView: View {
         case .low: return .green
         case .moderate: return .orange
         case .high: return .red
-        }
-    }
-
-    private func recordScore(_ score: Int) {
-        if useSimulator {
-            simulatorScoreHistory.append(score)
-            if simulatorScoreHistory.count > 20 {
-                simulatorScoreHistory.removeFirst(simulatorScoreHistory.count - 20)
-            }
-        } else {
-            realScoreHistory.append(score)
-            if realScoreHistory.count > 20 {
-                realScoreHistory.removeFirst(realScoreHistory.count - 20)
-            }
         }
     }
 
@@ -1173,11 +1487,13 @@ struct ContentView: View {
                 level: blended < 35 ? .low : (blended < 70 ? .moderate : .high),
                 details: nil
             )
+            let explanation = simulatedExplanation(for: sample, using: baselineSnapshot)
 
             DispatchQueue.main.async {
                 mlOffProb = mlProb
                 debugMLText = mlProb == nil ? "ML: nil" : String(format: "ML: %.3f", mlProb!)
                 latestRisk = improved
+                simExplanation = explanation
                 recordScore(improved.score0to100)
                 lastCheckTime = Date()
                 statusText = "Simulated \(mode == .hydrated ? "Hydrated" : "Dehydration") • score \(improved.score0to100)"
@@ -1186,341 +1502,392 @@ struct ContentView: View {
         }
     }
 
+    private func simulatedExplanation(for sample: VitalSample, using baseline: HydrationBaseline) -> String {
+        // Calculate baseline averages; if unavailable, return a default message
+        guard baseline.hr.n > 0 else {
+            return "Baseline data not available for comparison."
+        }
+
+        let avgHR = baseline.hr.mean
+        let avgHRV = baseline.hrv.mean
+        let avgRHR = baseline.rhr.mean
+
+        // Differences
+        let hrDiff = sample.heartRateBPM - avgHR
+        let hrvDiff = sample.hrvMS - avgHRV
+        let rhrDiff = sample.restingHeartRateBPM - avgRHR
+
+        // Thresholds for "abnormal" values (these can be tuned)
+        let hrThreshold = 10.0
+        let hrvThreshold = 20.0
+        let rhrThreshold = 10.0
+
+        var messages: [String] = []
+
+        if hrDiff > hrThreshold {
+            messages.append(String(format: "Heart Rate (%.0f) is above your baseline (%.0f).", sample.heartRateBPM, avgHR))
+        } else if hrDiff < -hrThreshold {
+            messages.append(String(format: "Heart Rate (%.0f) is below your baseline (%.0f).", sample.heartRateBPM, avgHR))
+        }
+
+        if hrvDiff < -hrThreshold {
+            messages.append(String(format: "HRV (%.0f ms) is below your baseline (%.0f ms).", sample.hrvMS, avgHRV))
+        } else if hrvDiff > hrvThreshold {
+            messages.append(String(format: "HRV (%.0f ms) is above your baseline (%.0f ms).", sample.hrvMS, avgHRV))
+        }
+
+        if rhrDiff > rhrThreshold {
+            messages.append(String(format: "Resting HR (%.0f) is above your baseline (%.0f).", sample.restingHeartRateBPM, avgRHR))
+        } else if rhrDiff < -rhrThreshold {
+            messages.append(String(format: "Resting HR (%.0f) is below your baseline (%.0f).", sample.restingHeartRateBPM, avgRHR))
+        }
+
+        if messages.isEmpty {
+            return "Sample readings are close to your baseline."
+        }
+
+        return messages.joined(separator: " ")
+    }
+
     // MARK: - Body
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(spacing: 14) {
+            VStack {
+                Picker("Tab", selection: $selectedTab) {
+                    Text("Current").tag(0)
+                    Text("History").tag(1)
+                }
+                .pickerStyle(.segmented)
+                .padding(.top, 8)
+                .padding(.horizontal, 16)
 
-                    Card(nil) {
-                        HStack(alignment: .top) {
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text("HydraSense")
-                                    .font(.largeTitle.bold())
+                if selectedTab == 0 {
+                    ScrollView {
+                        VStack(spacing: 14) {
 
-                                Text(statusText)
-                                    .font(.subheadline)
-                                    .foregroundStyle(.secondary)
+                            Card(nil) {
+                                HStack(alignment: .top) {
+                                    VStack(alignment: .leading, spacing: 6) {
+                                        Text("HydraSense")
+                                            .font(.largeTitle.bold())
 
-                                if !debugMLText.isEmpty {
-                                    Text(debugMLText)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
+                                        Text(statusText)
+                                            .font(.subheadline)
+                                            .foregroundStyle(.secondary)
 
-                            Spacer()
-
-                            StatusPill(
-                                text: useSimulator ? "Simulator" : "HealthKit",
-                                systemImage: useSimulator ? "sparkles" : "heart.fill",
-                                color: useSimulator ? .purple : .pink
-                            )
-                        }
-                    }
-
-                    Card("Baseline") {
-                        VStack(alignment: .leading, spacing: 10) {
-                            HStack {
-                                Text("Day \(baselineDay()) / 14")
-                                    .font(.subheadline.weight(.semibold))
-                                Spacer()
-                                Text("Samples: \(baseline.hr.n)")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-
-                            ProgressView(value: baselineProgress())
-                                .tint(.blue)
-
-                            Text(baselineComplete() ? "Baseline complete ✅" : "Building baseline for personalization…")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-
-                    Card("Monitoring") {
-                        VStack(spacing: 12) {
-                            HStack(spacing: 12) {
-                                Button(isMonitoringActive ? "Monitoring: ON" : "Start Monitoring") {
-                                    if !useSimulator {
-                                        isMonitoringActive = true
-                                        pollCount = 0
-                                        lastPollFiredAt = nil
-                                        Task { @MainActor in
-                                            performPollTick(restartHealthKitStream: true)
+                                        if !debugMLText.isEmpty {
+                                            Text(debugMLText)
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
                                         }
                                     }
-                                }
-                                .buttonStyle(PrimaryButtonStyle())
-                                .disabled(useSimulator)
 
-                                Button("Stop") {
-                                    isMonitoringActive = false
-                                    stopLiveStream()
-                                }
-                                .buttonStyle(SecondaryButtonStyle(tint: .red))
-                                .disabled(!isMonitoringActive)
-                            }
+                                    Spacer()
 
-                            HStack(spacing: 10) {
-                                Circle()
-                                    .fill(isMonitoringActive ? Color.green : Color.gray)
-                                    .frame(width: 10, height: 10)
-                                Text(isMonitoringActive ? "Live Monitoring Active" : "Monitoring Off")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                if let t = lastRefreshTime {
-                                    Text("Refreshed: \(t.formatted(date: .omitted, time: .shortened))")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-
-                            if isMonitoringActive && !useSimulator, let hr = liveDisplay.heartRateBPM {
-                                Text("Live: \(hr) bpm • sample \(liveDisplay.sampleAgeSec)s old")
-                                    .font(.subheadline.weight(.semibold))
-                                    .id(liveDisplay.pollCount)
-                            }
-
-                            if let lastPollFiredAt, isMonitoringActive && !useSimulator {
-                                Text("Last poll: \(lastPollFiredAt.formatted(date: .omitted, time: .shortened)) • Polls: \(pollCount)")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-
-                            if let hint = liveDisplay.syncHint {
-                                Text(hint)
-                                    .font(.caption)
-                                    .foregroundStyle(.orange)
-                            }
-
-                            if let d = lastHRDate {
-                                Text("HR sample age: \(Int(uiNow.timeIntervalSince(d)))s")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-
-                            if isMonitoringActive && !useSimulator,
-                               let d = lastHRDate,
-                               Int(uiNow.timeIntervalSince(d)) > 120 {
-                                Button("Open Health app to sync Watch data") {
-                                    if let url = URL(string: "x-apple-health://") {
-                                        UIApplication.shared.open(url)
-                                    }
-                                }
-                                .font(.caption)
-                            }
-
-                            if isMonitoringActive && !useSimulator && !debugTraceLines.isEmpty {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    HStack {
-                                        Text("Debug trace")
-                                            .font(.caption2.weight(.semibold))
-                                            .foregroundStyle(.secondary)
-                                        Spacer()
-                                        Button("Copy") {
-                                            UIPasteboard.general.string = debugTraceLines.joined(separator: "\n")
-                                            statusText = "Debug trace copied"
-                                        }
-                                        .font(.caption2)
-                                    }
-                                    ForEach(Array(debugTraceLines.suffix(8).enumerated()), id: \.offset) { _, line in
-                                        Text(line)
-                                            .font(.system(size: 9, design: .monospaced))
-                                            .foregroundStyle(.secondary)
-                                            .lineLimit(2)
-                                    }
-                                }
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                        }
-                    }
-
-                    if let ctx = lastActivity {
-                        Text("Activity: \(ctx.summary)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    Toggle(isOn: $useSimulator) {
-                        Text(useSimulator ? "Mode: Simulator" : "Mode: Real HealthKit")
-                    }
-                    .onChange(of: useSimulator) { newValue in
-                        if newValue {
-                            enterSimulatorMode()
-                        } else {
-                            latestRisk = nil
-                            debugMLText = ""
-                            realScoreHistory.removeAll()
-                            post = RiskPostProcessor()
-                            lastCheckTime = nil
-                            lastRefreshTime = nil
-                            lastHRDate = nil
-                            lastSeenHRDate = nil
-                            enterRealMode()
-                        }
-                    }
-
-                    Card("Risk") {
-                        if let risk = latestRisk {
-                            RiskBadge(level: risk.level, score: risk.score0to100)
-
-                            if let p = mlOffProb {
-                                Text(String(format: "Core ML off-probability: %.2f", p))
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-
-                            if let details = risk.details {
-                                Text(details)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(2)
-                            }
-                        } else {
-                            Text("No score yet.")
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-
-                    if !currentScoreHistory.isEmpty {
-                        Card("Score Trend") {
-                            Chart {
-                                ForEach(Array(currentScoreHistory.enumerated()), id: \.offset) { index, score in
-                                    LineMark(
-                                        x: .value("Reading", index + 1),
-                                        y: .value("Score", score)
+                                    StatusPill(
+                                        text: useSimulator ? "Simulator" : "HealthKit",
+                                        systemImage: useSimulator ? "sparkles" : "heart.fill",
+                                        color: useSimulator ? .purple : .pink
                                     )
                                 }
                             }
-                            .frame(height: 140)
-                        }
-                    }
 
-                    Divider()
+                            Card("Baseline") {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    HStack {
+                                        Text("Day \(baselineDay()) / 14")
+                                            .font(.subheadline.weight(.semibold))
+                                        Spacer()
+                                        Text("Samples: \(baseline.hr.n)")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
 
-                    if useSimulator {
-                        Button("Build Baseline (Simulated)") {
-                            baseline = HydrationBaseline()
-                            for _ in 0..<200 {
-                                let sample = simulator.next(mode: .hydrated)
-                                baseline.add(sample: sample)
-                            }
-                            latestRisk = nil
-                            statusText = "Baseline built: \(baseline.hr.n) samples"
-                        }
+                                    ProgressView(value: baselineProgress())
+                                        .tint(.blue)
 
-                        Button(isWorking ? "Working..." : "Simulate Hydrated Reading") {
-                            runSim(mode: .hydrated)
-                        }
-                        .disabled(isWorking)
-
-                        Button(isWorking ? "Working..." : "Simulate Dehydration-Like Reading") {
-                            runSim(mode: .dehydrationLike)
-                        }
-                        .disabled(isWorking)
-
-                    } else {
-                        Button("Build Baseline from HealthKit (Last 14 Days)") {
-                            statusText = "Building baseline from last 14 days..."
-                            healthKitManager.buildBaselineFromLastDays(days: 14) { newBaseline, daysUsed in
-                                guard let newBaseline = newBaseline else {
-                                    statusText = "Not enough Health data to build baseline."
-                                    return
+                                    Text(baselineComplete() ? "Baseline complete ✅" : "Building baseline for personalization…")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
                                 }
-                                baseline = newBaseline
-                                BaselineStore.shared.saveBaseline(baseline)
-                                let start = Calendar.current.date(byAdding: .day, value: -14, to: Date())!
-                                baselineStartDate = start
-                                UserDefaults.standard.set(start, forKey: "hydrasense.baselineStart")
-                                latestRisk = nil
-                                statusText = "Baseline built from \(daysUsed) days ✅"
                             }
-                        }
 
-                        Button("Read HealthKit (Real) → Score") {
-                            statusText = "Fetching vitals..."
-                            healthKitManager.fetchLatestVitals { sample in
-                                DispatchQueue.main.async {
-                                    guard let sample = sample else {
-                                        statusText = "No HealthKit samples found."
-                                        return
+                            Card("Monitoring") {
+                                VStack(spacing: 12) {
+                                    HStack(spacing: 12) {
+                                        Button(isMonitoringActive ? "Monitoring: ON" : "Start Monitoring") {
+                                            if !useSimulator {
+                                                isMonitoringActive = true
+                                                pollCount = 0
+                                                lastPollFiredAt = nil
+                                                Task { @MainActor in
+                                                    performPollTick(restartHealthKitStream: true)
+                                                }
+                                            }
+                                        }
+                                        .buttonStyle(PrimaryButtonStyle())
+                                        .disabled(useSimulator)
+
+                                        Button("Stop") {
+                                            isMonitoringActive = false
+                                            stopLiveStream()
+                                        }
+                                        .buttonStyle(SecondaryButtonStyle(tint: .red))
+                                        .disabled(!isMonitoringActive)
                                     }
 
-                                    debugPrintSample(sample, tag: "HK Manual Read")
-
-                                    if !isValidForML(sample) {
-                                        print("⚠️ sample fails sanity checks; skipping ML", sample)
-                                        mlOffProb = nil
-                                    } else {
-                                        mlOffProb = MLPredictor.shared.offProbability(sample: sample)
+                                    HStack(spacing: 10) {
+                                        Circle()
+                                            .fill(isMonitoringActive ? Color.green : Color.gray)
+                                            .frame(width: 10, height: 10)
+                                        Text(isMonitoringActive ? "Live Monitoring Active" : "Monitoring Off")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                        if let t = lastRefreshTime {
+                                            Text("Refreshed: \(t.formatted(date: .omitted, time: .shortened))")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                        }
                                     }
 
-                                    debugMLText = mlOffProb == nil ? "ML: nil" : String(format: "ML: %.3f", mlOffProb!)
+                                    if isMonitoringActive && !useSimulator, let hr = liveDisplay.heartRateBPM {
+                                        Text("Live: \(hr) bpm • sample \(liveDisplay.sampleAgeSec)s old")
+                                            .font(.subheadline.weight(.semibold))
+                                            .id(liveDisplay.pollCount)
+                                    }
 
-                                    print("📥 CoreML INPUTS",
-                                          "hr=\(sample.heartRateBPM)",
-                                          "hrv=\(sample.hrvMS)",
-                                          "rhr=\(sample.restingHeartRateBPM)")
+                                    if let lastPollFiredAt, isMonitoringActive && !useSimulator {
+                                        Text("Last poll: \(lastPollFiredAt.formatted(date: .omitted, time: .shortened)) • Polls: \(pollCount)")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+
+                                    if let hint = liveDisplay.syncHint {
+                                        Text(hint)
+                                            .font(.caption)
+                                            .foregroundStyle(.orange)
+                                    }
+
+                                    if let d = lastHRDate {
+                                        Text("HR sample age: \(Int(uiNow.timeIntervalSince(d)))s")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+
+                                    if isMonitoringActive && !useSimulator,
+                                       let d = lastHRDate,
+                                       Int(uiNow.timeIntervalSince(d)) > 120 {
+                                        Button("Open Health app to sync Watch data") {
+                                            if let url = URL(string: "x-apple-health://") {
+                                                UIApplication.shared.open(url)
+                                            }
+                                        }
+                                        .font(.caption)
+                                    }
+
+                                }
+                            }
+
+                            if let ctx = lastActivity {
+                                Text("Activity: \(ctx.summary)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            Toggle(isOn: $useSimulator) {
+                                Text(useSimulator ? "Mode: Simulator" : "Mode: Real HealthKit")
+                            }
+                            .onChange(of: useSimulator) { newValue in
+                                if newValue {
+                                    enterSimulatorMode()
+                                } else {
+                                    latestRisk = nil
+                                    debugMLText = ""
+                                    realScoreHistory.removeAll()
+                                    post = RiskPostProcessor()
+                                    lastCheckTime = nil
+                                    lastRefreshTime = nil
+                                    lastHRDate = nil
+                                    lastSeenHRDate = nil
+                                    simExplanation = nil
+                                    enterRealMode()
+                                }
+                            }
+
+                            Card("Risk") {
+                                if let risk = latestRisk {
+                                    RiskBadge(level: risk.level, score: risk.score0to100)
+
+                                    if useSimulator, let explanation = simExplanation {
+                                        Text(explanation)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                            .padding(.top, 4)
+                                    }
 
                                     if let p = mlOffProb {
-                                        print("✅ CoreML output offProbability =", p)
-                                    } else {
-                                        print("❌ CoreML output is NIL")
+                                        Text(String(format: "Core ML off-probability: %.2f", p))
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
                                     }
 
-                                    DataLogger.shared.append(sample: sample, label: "normal")
-                                    baseline.add(sample: sample)
-                                    BaselineStore.shared.saveBaseline(baseline)
-                                    baselineStartDate = BaselineStore.shared.saveStartDateIfNeeded()
-                                    HealthDataLogger.shared.updateLatest(sample: sample)
+                                    if let details = risk.details {
+                                        Text(details)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(2)
+                                    }
+                                } else {
+                                    Text("No score yet.")
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
 
-                                    if baselineComplete() {
-                                        let baseRisk = scorer.score(sample: sample, baseline: baseline, includeDetails: false)
-                                        let blended = blendedScore(zScore: baseRisk.score0to100, mlOffProb: mlOffProb)
-                                        let blendedRisk = HydrationRisk(
-                                            score0to100: blended,
-                                            level: blended < 35 ? .low : (blended < 70 ? .moderate : .high),
-                                            details: baseRisk.details
-                                        )
-                                        let improved = post.process(raw: blendedRisk, sample: sample)
-                                        recordScore(improved.score0to100)
-                                        lastCheckTime = Date()
-                                        latestRisk = improved
-                                        statusText = "Scored. Baseline n=\(baseline.hr.n)"
-
-                                        if improved.level == .high {
-                                            diagLog.log("NOTIFY: level=high score=\(improved.score0to100)")
-                                            NotificationManager.shared.sendDehydrationAlert(
-                                                score: improved.score0to100,
-                                                level: improved.level
+                            if !currentScoreHistory.isEmpty {
+                                Card("Score Trend") {
+                                    Chart {
+                                        ForEach(Array(currentScoreHistory.enumerated()), id: \.offset) { index, score in
+                                            LineMark(
+                                                x: .value("Reading", index + 1),
+                                                y: .value("Score", score)
                                             )
                                         }
-                                    } else {
-                                        latestRisk = nil
-                                        statusText = "Baseline building… Day \(baselineDay())/14 (n=\(baseline.hr.n))"
                                     }
+                                    .frame(height: 140)
+                                }
+                            }
+
+                            Divider()
+
+                            if useSimulator {
+                                Button("Build Baseline (Simulated)") {
+                                    baseline = HydrationBaseline()
+                                    for _ in 0..<200 {
+                                        let sample = simulator.next(mode: .hydrated)
+                                        baseline.add(sample: sample)
+                                    }
+                                    latestRisk = nil
+                                    statusText = "Baseline built: \(baseline.hr.n) samples"
+                                }
+
+                                Button(isWorking ? "Working..." : "Simulate Hydrated Reading") {
+                                    runSim(mode: .hydrated)
+                                }
+                                .disabled(isWorking)
+
+                                Button(isWorking ? "Working..." : "Simulate Dehydration-Like Reading") {
+                                    runSim(mode: .dehydrationLike)
+                                }
+                                .disabled(isWorking)
+
+                            } else {
+                                Button("Build Baseline from HealthKit (Last 14 Days)") {
+                                    statusText = "Building baseline from last 14 days..."
+                                    healthKitManager.buildBaselineFromLastDays(days: 14) { newBaseline, daysUsed in
+                                        guard let newBaseline = newBaseline else {
+                                            statusText = "Not enough Health data to build baseline."
+                                            return
+                                        }
+                                        baseline = newBaseline
+                                        BaselineStore.shared.saveBaseline(baseline)
+                                        let start = Calendar.current.date(byAdding: .day, value: -14, to: Date())!
+                                        baselineStartDate = start
+                                        UserDefaults.standard.set(start, forKey: "hydrasense.baselineStart")
+                                        latestRisk = nil
+                                        statusText = "Baseline built from \(daysUsed) days ✅"
+                                    }
+                                }
+
+                                Button("Read HealthKit (Real) → Score") {
+                                    statusText = "Fetching vitals..."
+                                    healthKitManager.fetchLatestVitals { sample in
+                                        DispatchQueue.main.async {
+                                            guard let sample = sample else {
+                                                statusText = "No HealthKit samples found."
+                                                return
+                                            }
+
+                                            debugPrintSample(sample, tag: "HK Manual Read")
+
+                                            if !isValidForML(sample) {
+                                                print("⚠️ sample fails sanity checks; skipping ML", sample)
+                                                mlOffProb = nil
+                                            } else {
+                                                mlOffProb = MLPredictor.shared.offProbability(sample: sample)
+                                            }
+
+                                            debugMLText = mlOffProb == nil ? "ML: nil" : String(format: "ML: %.3f", mlOffProb!)
+
+                                            print("📥 CoreML INPUTS",
+                                                  "hr=\(sample.heartRateBPM)",
+                                                  "hrv=\(sample.hrvMS)",
+                                                  "rhr=\(sample.restingHeartRateBPM)")
+
+                                            if let p = mlOffProb {
+                                                print("✅ CoreML output offProbability =", p)
+                                            } else {
+                                                print("❌ CoreML output is NIL")
+                                            }
+
+                                            DataLogger.shared.append(sample: sample, label: "normal")
+                                            baseline.add(sample: sample)
+                                            BaselineStore.shared.saveBaseline(baseline)
+                                            baselineStartDate = BaselineStore.shared.saveStartDateIfNeeded()
+                                            HealthDataLogger.shared.updateLatest(sample: sample)
+
+                                            if baselineComplete() {
+                                                let baseRisk = scorer.score(sample: sample, baseline: baseline, includeDetails: false)
+                                                let blended = blendedScore(zScore: baseRisk.score0to100, mlOffProb: mlOffProb)
+                                                let blendedRisk = HydrationRisk(
+                                                    score0to100: blended,
+                                                    level: blended < 35 ? .low : (blended < 70 ? .moderate : .high),
+                                                    details: baseRisk.details
+                                                )
+                                                let improved = post.process(raw: blendedRisk, sample: sample)
+                                                recordScore(improved.score0to100)
+                                                lastCheckTime = Date()
+                                                latestRisk = improved
+                                                statusText = "Scored. Baseline n=\(baseline.hr.n)"
+
+                                                if improved.level == .high {
+                                                    diagLog.log("NOTIFY: level=high score=\(improved.score0to100)")
+                                                    NotificationManager.shared.sendDehydrationAlert(
+                                                        score: improved.score0to100,
+                                                        level: improved.level
+                                                    )
+                                                }
+                                            } else {
+                                                latestRisk = nil
+                                                statusText = "Baseline building… Day \(baselineDay())/14 (n=\(baseline.hr.n))"
+                                            }
+                                        }
+                                    }
+                                }
+
+                                Button("Reset Baseline") {
+                                    BaselineStore.shared.reset()
+                                    baseline = HydrationBaseline()
+                                    baselineStartDate = nil
+                                    latestRisk = nil
+                                    statusText = "Baseline reset."
+                                }
+
+                                Button("Force Backfill Risk Score History") {
+                                    backfillRiskScoreHistory()
                                 }
                             }
                         }
-
-                        Button("Reset Baseline") {
-                            BaselineStore.shared.reset()
-                            baseline = HydrationBaseline()
-                            baselineStartDate = nil
-                            latestRisk = nil
-                            statusText = "Baseline reset."
-                        }
+                        .padding(.horizontal, 16)
+                        .padding(.top, 12)
+                        .padding(.bottom, 28)
+                        .frame(maxWidth: .infinity)
                     }
+                } else {
+                    HistoryView(entries: allScoreHistory, range: historyRange)
                 }
-                .padding(.horizontal, 16)
-                .padding(.top, 12)
-                .padding(.bottom, 28)
-                .frame(maxWidth: .infinity)
             }
-            .navigationTitle("")
+            .navigationTitle(selectedTab == 0 ? "" : "Score History")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -1536,6 +1903,7 @@ struct ContentView: View {
                     showSettings: $showSettings,
                     statusText: $statusText,
                     showResetConfirm: $showResetConfirm,
+                    historyRangeRawValue: $historyRangeRawValue,
                     onShowCSV: {
                         statusText = DataLogger.shared.exportPath()
                     },
@@ -1556,68 +1924,170 @@ struct ContentView: View {
                     }
                 )
             }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .hydrasenseAppBecameActive)) { _ in
-            guard !useSimulator, isMonitoringActive else { return }
-            Task { @MainActor in
-                performPollTick(restartHealthKitStream: true)
+            .onReceive(NotificationCenter.default.publisher(for: .hydrasenseAppBecameActive)) { _ in
+                guard !useSimulator, isMonitoringActive else { return }
+                Task { @MainActor in
+                    performPollTick(restartHealthKitStream: true)
+                    backfillRiskScoreHistory()
+                }
             }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .hydrasenseHealthKitUpdate)) { _ in
-            guard !useSimulator, isMonitoringActive else { return }
-            Task { @MainActor in
+            .onReceive(NotificationCenter.default.publisher(for: .hydrasenseHealthKitUpdate)) { _ in
+                guard !useSimulator, isMonitoringActive else { return }
+                Task { @MainActor in
+                    // #region agent log
+                    DebugSessionLog.log(
+                        hypothesisId: "A",
+                        location: "ContentView.healthKitNotification",
+                        message: "HealthKit background delivery notification",
+                        runId: "post-fix"
+                    )
+                    // #endregion
+                    refreshNow()
+                }
+            }
+            .onReceive(uiTimer) { now in
+                uiNow = now
+            }
+            .onReceive(healthPollTimer) { _ in
+                guard !useSimulator, isMonitoringActive else { return }
+                performPollTick(restartHealthKitStream: false)
+            }
+            .onAppear {
+                PhoneConnectivityManager.shared.activate()
+                DebugSessionLog.onTrace = { line in
+                    debugTraceLines.append(line)
+                    if debugTraceLines.count > 24 {
+                        debugTraceLines.removeFirst(debugTraceLines.count - 24)
+                    }
+                }
+                loadScoreHistory()
+                backfillRiskScoreHistory()
+                if !useSimulator && isMonitoringActive {
+                    startLiveStream()
+                }
+            }
+            .onDisappear {
+                // Do not stop live stream on disappear — only on explicit Stop button.
+            }
+            .onChange(of: scenePhase) { phase in
                 // #region agent log
                 DebugSessionLog.log(
-                    hypothesisId: "A",
-                    location: "ContentView.healthKitNotification",
-                    message: "HealthKit background delivery notification",
-                    runId: "post-fix"
+                    hypothesisId: "D",
+                    location: "ContentView.scenePhase",
+                    message: "scenePhase changed",
+                    data: [
+                        "phase": String(describing: phase),
+                        "isMonitoringActive": isMonitoringActive,
+                        "useSimulator": useSimulator
+                    ]
                 )
                 // #endregion
-                refreshNow()
-            }
-        }
-        .onReceive(uiTimer) { now in
-            uiNow = now
-        }
-        .onReceive(healthPollTimer) { _ in
-            guard !useSimulator, isMonitoringActive else { return }
-            performPollTick(restartHealthKitStream: false)
-        }
-        .onAppear {
-            DebugSessionLog.onTrace = { line in
-                debugTraceLines.append(line)
-                if debugTraceLines.count > 24 {
-                    debugTraceLines.removeFirst(debugTraceLines.count - 24)
+                if phase == .active && !useSimulator && isMonitoringActive {
+                    Task { @MainActor in
+                        printLatestSampleToConsole()
+                        performPollTick(restartHealthKitStream: true)
+                    }
                 }
-            }
-            if !useSimulator && isMonitoringActive {
-                startLiveStream()
+                // Query keeps running in background — intentionally no stop here.
             }
         }
-        .onDisappear {
-            // Do not stop live stream on disappear — only on explicit Stop button.
-        }
-        .onChange(of: scenePhase) { phase in
-            // #region agent log
-            DebugSessionLog.log(
-                hypothesisId: "D",
-                location: "ContentView.scenePhase",
-                message: "scenePhase changed",
-                data: [
-                    "phase": String(describing: phase),
-                    "isMonitoringActive": isMonitoringActive,
-                    "useSimulator": useSimulator
-                ]
+    }
+}
+
+// MARK: - HistoryView
+
+private struct HistoryView: View {
+    let entries: [ScoreHistoryEntry]
+    let range: HistoryRange
+
+    private var filteredEntries: [ScoreHistoryEntry] {
+        entries
+            .filter { range.includes($0.date) }
+            .sorted { $0.date < $1.date }
+    }
+
+    /// Consecutive identical scores are one continuous state, not separate insights.
+    /// Keep the first and last timestamps so the user can still see how long it lasted.
+    private var displayedEntries: [DisplayScoreHistoryEntry] {
+        filteredEntries.reduce(into: [DisplayScoreHistoryEntry]()) { result, entry in
+            guard let last = result.last,
+                  last.score == entry.score,
+                  last.riskLevel == entry.riskLevel else {
+                result.append(DisplayScoreHistoryEntry(
+                    id: entry.id,
+                    score: entry.score,
+                    riskLevel: entry.riskLevel,
+                    firstDate: entry.date,
+                    lastDate: entry.date,
+                    readingCount: 1
+                ))
+                return
+            }
+
+            result[result.count - 1] = DisplayScoreHistoryEntry(
+                id: last.id,
+                score: last.score,
+                riskLevel: last.riskLevel,
+                firstDate: last.firstDate,
+                lastDate: entry.date,
+                readingCount: last.readingCount + 1
             )
-            // #endregion
-            if phase == .active && !useSimulator && isMonitoringActive {
-                Task { @MainActor in
-                    printLatestSampleToConsole()
-                    performPollTick(restartHealthKitStream: true)
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            if filteredEntries.isEmpty {
+                Text("No scores recorded in the selected range.")
+                    .foregroundStyle(.secondary)
+            } else {
+                Chart {
+                    ForEach(displayedEntries) { entry in
+                        PointMark(
+                            x: .value("Date", entry.lastDate),
+                            y: .value("Score", entry.score)
+                        ).foregroundStyle(by: .value("Level", entry.riskLevel.rawValue))
+                    }
+                }
+                .frame(height: 160)
+                .padding(.bottom, 20)
+                List(displayedEntries.reversed()) { entry in
+                    HStack {
+                        VStack(alignment: .leading) {
+                            Text("Score: \(entry.score)")
+                                .font(.body.weight(.semibold))
+                            Text(entry.riskLevel.rawValue.capitalized)
+                                .font(.caption)
+                                .foregroundStyle(color(for: entry.riskLevel))
+                        }
+                        Spacer()
+                        VStack(alignment: .trailing, spacing: 2) {
+                            if entry.readingCount > 1 {
+                                Text("\(entry.readingCount) readings")
+                                    .font(.caption.weight(.medium))
+                            }
+                            Text(entry.firstDate, style: .date)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            if !Calendar.current.isDate(entry.firstDate, inSameDayAs: entry.lastDate) {
+                                Text("to \(entry.lastDate.formatted(date: .abbreviated, time: .omitted))")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .padding(.vertical, 4)
                 }
             }
-            // Query keeps running in background — intentionally no stop here.
+        }
+        .padding(.horizontal, 18)
+        .navigationTitle("Score History")
+    }
+    private func color(for level: HydrationRiskLevel) -> Color {
+        switch level {
+        case .low: return .green
+        case .moderate: return .orange
+        case .high: return .red
         }
     }
 }
@@ -1628,6 +2098,7 @@ private struct SettingsSheet: View {
     @Binding var showSettings: Bool
     @Binding var statusText: String
     @Binding var showResetConfirm: Bool
+    @Binding var historyRangeRawValue: String
 
     let onShowCSV: () -> Void
     let onCheckCSV: () -> Void
@@ -1637,9 +2108,23 @@ private struct SettingsSheet: View {
     var body: some View {
         NavigationStack {
             List {
+                Section("History") {
+                    Picker("Show history from", selection: $historyRangeRawValue) {
+                        ForEach(HistoryRange.allCases) { range in
+                            Text(range.rawValue).tag(range.rawValue)
+                        }
+                    }
+                    Text("Repeated consecutive scores are combined into one entry.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
                 Section("Data") {
                     Button("Show Training CSV Path") { onShowCSV() }
                     Button("Check CSV Exists") { onCheckCSV() }
+                    Button("Force Backfill Risk Score History") {
+                        onBackfillHistory?()
+                    }
                 }
 
                 Section("Notifications") {
@@ -1682,6 +2167,8 @@ private struct SettingsSheet: View {
             }
         }
     }
+
+    var onBackfillHistory: (() -> Void)? = nil
 }
 
 private struct Card<Content: View>: View {
@@ -1805,4 +2292,3 @@ private struct RiskBadge: View {
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 }
-
